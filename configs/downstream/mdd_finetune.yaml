@@ -1,0 +1,29 @@
+output_root: 'output_dirs'
+data_make_fn: 'load_mdd'
+nb_classes: 2
+task: 'classification'
+downstream_task: 'fine_tune'
+
+# model params
+model_name: 'vit_base'
+crop_size: [90, 116]
+patch_size: 8
+pred_depth: 4
+pred_emb_dim: 256
+attn_mode: 'normal'
+add_w: 'mapping'
+downsample: true
+
+# training params
+batch_size: 16
+epochs: 20
+blr: 0.01
+min_lr: 0.000001
+smoothing: 0.0
+num_seed: 5
+
+# path params
+load_path: 'logs/mdd_classification'
+load_epoch: '50'  # 使用训练50轮后的模型
+
+gradient_checkpointing: false 

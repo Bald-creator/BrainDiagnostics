@@ -45,8 +45,25 @@ def _no_grad_trunc_normal_(tensor, mean, std, a, b):
 
 
 def trunc_normal_(tensor, mean=0., std=1., a=-2., b=2.):
-    # type: (Tensor, float, float, float, float) -> Tensor
-    return _no_grad_trunc_normal_(tensor, mean, std, a, b)
+    """
+    截断正态分布初始化
+    
+    参数:
+        tensor: 要初始化的张量
+        mean: 均值
+        std: 标准差
+        a: 最小截断值
+        b: 最大截断值
+    
+    返回:
+        初始化后的张量
+    """
+    # 使用PyTorch内置的trunc_normal_或实现自定义逻辑
+    if hasattr(torch.nn.init, 'trunc_normal_'):
+        return torch.nn.init.trunc_normal_(tensor, mean=mean, std=std, a=a, b=b)
+    else:
+        # 手动实现截断正态分布初始化
+        return _no_grad_trunc_normal_(tensor, mean, std, a, b)
 
 
 def apply_masks(x, masks):
@@ -61,10 +78,21 @@ def apply_masks(x, masks):
     return torch.cat(all_x, dim=0)
 
 
-def repeat_interleave_batch(x, B, repeat):
-    N = len(x) // B
-    x = torch.cat([
-        torch.cat([x[i*B:(i+1)*B] for _ in range(repeat)], dim=0)
-        for i in range(N)
-    ], dim=0)
-    return x
+def repeat_interleave_batch(tensor, batch_size):
+    """
+    在批次维度上重复张量
+    
+    参数:
+        tensor: 输入张量
+        batch_size: 目标批次大小
+    
+    返回:
+        重复后的张量
+    """
+    # 对于一维张量
+    if tensor.dim() == 1:
+        return tensor.repeat(batch_size)
+    # 对于多维张量，只在第一个维度（批次维度）重复
+    else:
+        repeat_shape = [batch_size] + [1] * (tensor.dim() - 1)
+        return tensor.repeat(*repeat_shape)

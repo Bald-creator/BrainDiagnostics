@@ -9,14 +9,71 @@ import numpy as np
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from src.utils.tensors import (
-    trunc_normal_,
-    repeat_interleave_batch
-)
-from src.masks.utils import apply_masks
+from timm.layers import Mlp, DropPath, PatchEmbed
+from einops import rearrange, repeat
 
-from flash_attn import flash_attn_qkvpacked_func
+# 从src.utils.tensors导入需要的函数
+try:
+    from src.utils.tensors import (
+        trunc_normal_,
+        repeat_interleave_batch,
+    )
+except ImportError:
+    # 如果无法导入，提供备用实现
+    def trunc_normal_(tensor, mean=0., std=1., a=-2., b=2.):
+        # 使用PyTorch内置的截断正态分布初始化
+        return torch.nn.init.trunc_normal_(tensor, mean, std, a, b)
+    
+    def repeat_interleave_batch(tensor, batch_size):
+        # 实现batch维度的重复
+        return tensor.repeat(batch_size, *[1 for _ in range(tensor.dim() - 1)])
+
+
+# 尝试导入flash_attn，如果不可用则继续
+flash_attn_available = False
+try:
+    from flash_attn import flash_attn_qkvpacked_func
+    flash_attn_available = True
+except ImportError:
+    # 如果flash_attn不可用，不导入对应函数
+    pass
+
+
+# CUDA兼容性检查
+def is_flash_attn_available():
+    """检查是否可以使用flash attention"""
+    return flash_attn_available and torch.cuda.is_available()
+
+
+# 实现apply_masks函数
+def apply_masks(x, masks):
+    """应用掩码到输入张量
+    
+    参数:
+        x: 输入张量 [B, N, C]
+        masks: 掩码张量 [B, N], 值为0或1，1表示保留，0表示遮盖
+        
+    返回:
+        应用掩码后的张量
+    """
+    if masks is None:
+        return x
+    
+    # 确保掩码是布尔类型
+    if masks.dtype != torch.bool:
+        masks = masks.bool()
+    
+    # 应用掩码
+    B, N, C = x.shape
+    x_masked = x.clone()
+    
+    # 将遮盖位置的值设为0
+    for i in range(B):
+        x_masked[i, ~masks[i]] = 0
+    
+    return x_masked
 
 
 class GradTs_2dPE(nn.Module):
@@ -196,8 +253,18 @@ class MLP(nn.Module):
         return x
 
 
+# 使用普通注意力机制的自注意力层
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0., attn_mode='normal'):
+    def __init__(
+        self,
+        dim,
+        num_heads=8,
+        qkv_bias=False,
+        qk_scale=None,
+        attn_drop=0.0,
+        proj_drop=0.0,
+        attn_mode='normal'
+    ):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
@@ -207,33 +274,54 @@ class Attention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
-        self.proj_drop_rate = proj_drop
         
+        # 注意力模式，可以是flash_attn或normal
         self.attn_mode = attn_mode
 
-    def forward(self, x, return_attn=None):
+    def forward(self, x, return_attn=False):
+        """
+        x: [B, N, C]
+        """
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
-        if self.attn_mode == 'normal':
-            qkv = qkv.permute(2, 0, 3, 1, 4)
-            q, k, v = qkv[0], qkv[1], qkv[2]
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # B, num_heads, N, C/num_heads
 
+        if self.attn_mode == 'flash_attn' and is_flash_attn_available():
+            try:
+                from flash_attn import flash_attn_qkvpacked_func
+                with torch.cuda.amp.autocast(enabled=False):
+                    # qkv: [B, N, 3, num_heads, C/num_heads]
+                    qkv_packed = qkv.permute(1, 3, 0, 2, 4)  # [B, N, 3, num_heads, C/num_heads]
+                    # Convert to half precision
+                    qkv_packed = qkv_packed.half()
+                    out = flash_attn_qkvpacked_func(qkv_packed, dropout_p=0.0 if not self.training else self.attn_drop.p)
+                    x = out.view(B, N, C)
+                    if return_attn:
+                        # 计算普通注意力以返回注意力矩阵
+                        attn = (q @ k.transpose(-2, -1)) * self.scale
+                        attn = attn.softmax(dim=-1)
+                        return x, attn
+                    return x, None
+            except (ImportError, Exception) as e:
+                print(f"Warning: Flash Attention unavailable, error: {e}. Falling back to regular attention.")
+                # 使用普通的注意力机制
+                attn = (q @ k.transpose(-2, -1)) * self.scale
+                attn = attn.softmax(dim=-1)
+                attn = self.attn_drop(attn)
+                x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        else:
+            # 普通的注意力机制
             attn = (q @ k.transpose(-2, -1)) * self.scale
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
-
-            x = (attn @ v).transpose(1, 2)
-        elif self.attn_mode == 'flash_attn':
-            x = flash_attn_qkvpacked_func(qkv, dropout_p=self.proj_drop_rate)
+            x = (attn @ v).transpose(1, 2).reshape(B, N, C)
             if return_attn:
-                x, attn, _ = flash_attn_qkvpacked_func(qkv, dropout_p=self.proj_drop_rate)
-        else:
-            raise Exception('error')
-        x = x.reshape(B, N, C)
+                return x, attn
+
         x = self.proj(x)
         x = self.proj_drop(x)
         if return_attn:
-            return x, attn
+            return x, None
         return x, None
 
 
@@ -244,14 +332,14 @@ class Block(nn.Module):
         self.norm1 = norm_layer(dim)
         self.attn = Attention(
             dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop, attn_mode=attn_mode)
+        # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = MLP(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
     def forward(self, x, return_attention=False):
         y, attn = self.attn(self.norm1(x), return_attention)
-
         x = x + self.drop_path(y)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         if return_attention:
@@ -420,6 +508,7 @@ class VisionTransformer(nn.Module):
         attn_mode='normal',
         add_w=False,
         gradient_checkpointing=False,
+        num_classes=0,  # 0表示没有分类头
         **kwargs
     ):
         super().__init__()
@@ -434,9 +523,19 @@ class VisionTransformer(nn.Module):
             embed_dim=embed_dim)
         num_patches = self.patch_embed.num_patches
         self.num_patches_2d = self.patch_embed.num_patches_2d
-        # -- gradient pos embedding
-        self.gradient_pos_embed = gradient_pos_embed
-        self.pos_embed_proj = GradTs_2dPE(gradient_pos_embed.shape[-1], embed_dim, self.num_patches_2d, add_w=add_w, cls_token=False)
+        
+        # -- 处理位置编码
+        if gradient_pos_embed is not None:
+            # 使用梯度位置编码
+            self.gradient_pos_embed = gradient_pos_embed
+            self.pos_embed_proj = GradTs_2dPE(gradient_pos_embed.shape[-1], embed_dim, self.num_patches_2d, add_w=add_w, cls_token=False)
+        else:
+            # 使用标准的正弦余弦位置编码
+            self.gradient_pos_embed = None
+            self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
+            pos_embed = get_2d_sincos_pos_embed(embed_dim, (self.num_patches_2d[0], self.num_patches_2d[1]), cls_token=False)
+            self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+        
         # --
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
         self.blocks = nn.ModuleList([
@@ -445,6 +544,13 @@ class VisionTransformer(nn.Module):
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, attn_mode=attn_mode)
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
+        
+        # 添加分类头（如果需要）
+        if num_classes > 0:
+            self.head = nn.Linear(embed_dim, num_classes)
+        else:
+            self.head = None
+            
         # ------
         self.init_std = init_std
         self.apply(self._init_weights)
@@ -480,10 +586,14 @@ class VisionTransformer(nn.Module):
         x = self.patch_embed(x)
         B, N, D = x.shape
 
-        # -- add positional embedding to x
-        pos_embed = self.pos_embed_proj(self.gradient_pos_embed)
-        # pos_embed = self.interpolate_pos_encoding(x, pos_embed)
-        x = x + pos_embed
+        # -- 添加位置编码
+        if self.gradient_pos_embed is not None:
+            # 使用梯度位置编码
+            pos_embed = self.pos_embed_proj(self.gradient_pos_embed)
+            x = x + pos_embed
+        else:
+            # 使用标准位置编码
+            x = x + self.pos_embed
 
         # -- mask x
         if masks is not None:
@@ -508,6 +618,14 @@ class VisionTransformer(nn.Module):
         if self.norm is not None:
             x = self.norm(x)
         
+        # 如果有分类头，计算分类结果（全局平均池化后接线性层）
+        if self.head is not None:
+            x_cls = x.mean(dim=1)  # 全局平均池化 [B, N, D] -> [B, D]
+            x_cls = self.head(x_cls)  # [B, num_classes]
+            if return_attention:
+                return x_cls, attn_set
+            return x_cls
+            
         if return_attention:
             return x, attn_set
         return x
